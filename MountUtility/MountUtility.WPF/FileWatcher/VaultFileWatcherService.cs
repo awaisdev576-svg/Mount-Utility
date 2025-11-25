@@ -209,11 +209,18 @@ namespace MountUtility.WPF.FileWatcher
         {
             if ((ShouldSkipFile(e.FullPath) && ShouldSkipFile(e.OldFullPath)) || AreEventsSuppressed()) return;
 
-            // Handle rename immediately without debounce to catch quick renames
+            // For directories, add a delay to allow Windows to report all nested events
+            var delayMs = Directory.Exists(e.FullPath) ? 300 : 0;
+
             _ = Task.Run(async () =>
             {
                 try
                 {
+                    if (delayMs > 0)
+                    {
+                        await Task.Delay(delayMs);
+                    }
+
                     if (OnChangeDetected != null)
                     {
                         await OnChangeDetected(e.FullPath, FileChangeType.Renamed, e.OldFullPath);

@@ -208,6 +208,10 @@ namespace MountUtility.Services
 
                                     // Scan directory and sync any missing children (handles moved folders)
                                     await SyncDirectoryContentsAsync(fullPath, newRel);
+
+                                    // After move, reconcile to clean up any orphaned entries in vault
+                                    await Task.Delay(500);
+                                    await ReconcileVaultWithPhysicalDriveAsync();
                                 }
                                 // If it's a file, re-read and update content (in case it changed during rename)
                                 else if (File.Exists(fullPath))
@@ -235,6 +239,8 @@ namespace MountUtility.Services
                                 {
                                     await _virtualDiskService.CreateDirectoryAsync(_activeDiskId.Value, newRel);
                                     await SyncDirectoryContentsAsync(fullPath, newRel);
+                                    await Task.Delay(500);
+                                    await ReconcileVaultWithPhysicalDriveAsync();
                                 }
                                 else if (File.Exists(fullPath))
                                 {
@@ -462,6 +468,66 @@ namespace MountUtility.Services
             catch (Exception ex)
             {
                 Console.WriteLine($"⚠️ Error syncing directory contents: {ex.Message}");
+            }
+        }
+
+        public async Task ReconcileVaultWithPhysicalDriveAsync()
+        {
+            if (!_activeDiskId.HasValue || string.IsNullOrEmpty(_activeMountPath))
+            {
+                return;
+            }
+
+            try
+            {
+                Console.WriteLine("🔄 Starting vault/physical drive reconciliation...");
+
+                // Get all files from vault
+                var vaultFiles = await _virtualDiskService.GetFilesAsync(_activeDiskId.Value, "/");
+
+                // Check for files/folders in vault that are missing from physical drive
+                var toDelete = new List<string>();
+                foreach (var vaultFile in vaultFiles)
+                {
+                    var physicalPath = _activeMountPath.TrimEnd('\\') + vaultFile.Path.Replace("/", "\\");
+
+                    if (vaultFile.IsDirectory)
+                    {
+                        if (!Directory.Exists(physicalPath))
+                        {
+                            toDelete.Add(vaultFile.Path);
+                            Console.WriteLine($"⚠️ Directory missing from physical drive, marking for deletion: {vaultFile.Path}");
+                        }
+                    }
+                    else
+                    {
+                        if (!File.Exists(physicalPath))
+                        {
+                            toDelete.Add(vaultFile.Path);
+                            Console.WriteLine($"⚠️ File missing from physical drive, marking for deletion: {vaultFile.Path}");
+                        }
+                    }
+                }
+
+                // Delete missing entries from vault
+                foreach (var path in toDelete)
+                {
+                    await _virtualDiskService.DeleteFileAsync(_activeDiskId.Value, path);
+                    Console.WriteLine($"🗑️ Removed from vault: {path}");
+                }
+
+                if (toDelete.Count > 0)
+                {
+                    Console.WriteLine($"✅ Reconciliation complete: removed {toDelete.Count} orphaned entries from vault");
+                }
+                else
+                {
+                    Console.WriteLine("✅ Reconciliation complete: all vault entries have physical copies");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Reconciliation error: {ex.Message}");
             }
         }
 
