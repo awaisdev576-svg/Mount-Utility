@@ -23,6 +23,10 @@ namespace MountUtility.Services
         private readonly ConcurrentDictionary<string, DateTime> _recentWrites = new();
         private const int RecentWriteWindowMs = 2000;
 
+        // Track directories that are being moved to suppress delete events for their children
+        private readonly ConcurrentDictionary<string, DateTime> _movingDirectories = new();
+        private const int MovingDirectoryWindowMs = 5000;
+
         public RealtimeVaultSyncService(
             ICryptographyService cryptographyService,
             IDiskRepository diskRepository,
@@ -75,6 +79,10 @@ namespace MountUtility.Services
             try
             {
                 _isSyncing = true;
+
+                // Periodically clean up expired moving directory markers
+                CleanupExpiredMovingDirectories();
+
                 Console.WriteLine($"🔄 Syncing {changeType}: {Path.GetFileName(fullPath)}");
 
                 var disk = await _disk_repository_GetByIdSafeAsync(_activeDiskId.Value);
@@ -174,6 +182,13 @@ namespace MountUtility.Services
 
                     case FileChangeType.Deleted:
                         {
+                            // Check if this file is being deleted because its parent directory is moving
+                            if (IsDirectoryMoving(fullPath))
+                            {
+                                Console.WriteLine($"⏭️ Skipping delete for file in moving directory: {fullPath}");
+                                return;
+                            }
+
                             // if a directory was deleted, DeleteFileAsync can handle directory entry if present
                             var rel = GetRelativePath(fullPath, _activeMountPath!);
                             var deleted = await _virtualDiskService.DeleteFileAsync(_active_disk_Id_or_throw(_activeDiskId.Value), rel);
@@ -190,6 +205,12 @@ namespace MountUtility.Services
                             {
                                 Console.WriteLine("⚠️ Rename event missing old path.");
                                 return;
+                            }
+
+                            // If renaming a directory, mark it as moving to suppress child delete events
+                            if (Directory.Exists(fullPath))
+                            {
+                                MarkDirectoryAsMoving(oldPath);
                             }
 
                             var oldRel = GetRelativePath(oldPath, _activeMountPath!);
@@ -210,8 +231,22 @@ namespace MountUtility.Services
                                     await SyncDirectoryContentsAsync(fullPath, newRel);
 
                                     // After move, reconcile to clean up any orphaned entries in vault
-                                    await Task.Delay(500);
+                                    await Task.Delay(800);
                                     await ReconcileVaultWithPhysicalDriveAsync();
+
+                                    // Also ensure the new directory path exists physically (in case it wasn't created by sync)
+                                    if (!Directory.Exists(fullPath))
+                                    {
+                                        try
+                                        {
+                                            Directory.CreateDirectory(fullPath);
+                                            Console.WriteLine($"✅ Ensured physical directory exists: {newRel}");
+                                        }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($"⚠️ Failed to ensure directory exists: {ex.Message}");
+                                        }
+                                    }
                                 }
                                 // If it's a file, re-read and update content (in case it changed during rename)
                                 else if (File.Exists(fullPath))
@@ -485,50 +520,136 @@ namespace MountUtility.Services
                 // Get all files from vault
                 var vaultFiles = await _virtualDiskService.GetFilesAsync(_activeDiskId.Value, "/");
 
-                // Check for files/folders in vault that are missing from physical drive
+                // Build a map of physical files/directories
+                var physicalFiles = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase); // path -> isDirectory
+                ScanPhysicalDriveForReconciliation(_activeMountPath, physicalFiles);
+
+                // Check for files/folders in vault that are missing or misplaced
                 var toDelete = new List<string>();
+                var toMove = new List<(string oldPath, string newPath)>(); // For files that exist but at wrong path
+
                 foreach (var vaultFile in vaultFiles)
                 {
-                    var physicalPath = _activeMountPath.TrimEnd('\\') + vaultFile.Path.Replace("/", "\\");
+                    var vaultPhysicalPath = _activeMountPath.TrimEnd('\\') + vaultFile.Path.Replace("/", "\\");
+                    var normalizedVaultPath = Path.GetFullPath(vaultPhysicalPath).ToLowerInvariant();
 
-                    if (vaultFile.IsDirectory)
+                    if (physicalFiles.ContainsKey(normalizedVaultPath))
                     {
-                        if (!Directory.Exists(physicalPath))
-                        {
-                            toDelete.Add(vaultFile.Path);
-                            Console.WriteLine($"⚠️ Directory missing from physical drive, marking for deletion: {vaultFile.Path}");
-                        }
+                        // File exists at expected location, all good
+                        continue;
+                    }
+
+                    // File is missing from expected location
+                    // Check if it exists somewhere else (indicates a move that we didn't fully capture)
+                    var foundAt = TryFindFileInPhysicalDrive(vaultFile.Name, vaultFile.IsDirectory, _activeMountPath);
+
+                    if (foundAt != null)
+                    {
+                        // File was moved but vault still has old path
+                        var newVaultPath = GetRelativePath(foundAt, _activeMountPath!);
+                        toMove.Add((vaultFile.Path, newVaultPath));
+                        Console.WriteLine($"📍 Found {vaultFile.Name} at different location: {vaultFile.Path} → {newVaultPath}");
                     }
                     else
                     {
-                        if (!File.Exists(physicalPath))
-                        {
-                            toDelete.Add(vaultFile.Path);
-                            Console.WriteLine($"⚠️ File missing from physical drive, marking for deletion: {vaultFile.Path}");
-                        }
+                        // File truly missing
+                        toDelete.Add(vaultFile.Path);
+                        Console.WriteLine($"⚠️ File missing from physical drive, marking for deletion: {vaultFile.Path}");
                     }
                 }
 
-                // Delete missing entries from vault
+                // Move files in vault to their correct paths
+                foreach (var (oldPath, newPath) in toMove)
+                {
+                    var moved = await _virtualDiskService.RenameFileAsync(_activeDiskId.Value, oldPath, newPath);
+                    if (moved)
+                    {
+                        Console.WriteLine($"✅ Moved in vault: {oldPath} → {newPath}");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"⚠️ Failed to move in vault: {oldPath} → {newPath}");
+                    }
+                }
+
+                // Delete truly missing entries from vault
                 foreach (var path in toDelete)
                 {
                     await _virtualDiskService.DeleteFileAsync(_activeDiskId.Value, path);
                     Console.WriteLine($"🗑️ Removed from vault: {path}");
                 }
 
-                if (toDelete.Count > 0)
+                if (toMove.Count > 0 || toDelete.Count > 0)
                 {
-                    Console.WriteLine($"✅ Reconciliation complete: removed {toDelete.Count} orphaned entries from vault");
+                    Console.WriteLine($"✅ Reconciliation complete: moved {toMove.Count}, removed {toDelete.Count} entries");
                 }
                 else
                 {
-                    Console.WriteLine("✅ Reconciliation complete: all vault entries have physical copies");
+                    Console.WriteLine("✅ Reconciliation complete: all vault entries match physical drive");
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"⚠️ Reconciliation error: {ex.Message}");
             }
+        }
+
+        private void ScanPhysicalDriveForReconciliation(string rootPath, Dictionary<string, bool> result)
+        {
+            try
+            {
+                var stack = new Stack<string>();
+                stack.Push(rootPath);
+
+                while (stack.Count > 0)
+                {
+                    var current = stack.Pop();
+
+                    try
+                    {
+                        var normalized = Path.GetFullPath(current).ToLowerInvariant();
+                        result[normalized] = true; // Directory
+
+                        foreach (var dir in Directory.GetDirectories(current))
+                        {
+                            if (ShouldSkipSystemFile(Path.GetFileName(dir))) continue;
+                            stack.Push(dir);
+                        }
+
+                        foreach (var file in Directory.GetFiles(current))
+                        {
+                            if (ShouldSkipSystemFile(Path.GetFileName(file))) continue;
+                            var normalizedFile = Path.GetFullPath(file).ToLowerInvariant();
+                            result[normalizedFile] = false; // File
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"⚠️ Error scanning physical drive: {ex.Message}");
+            }
+        }
+
+        private string? TryFindFileInPhysicalDrive(string fileName, bool isDirectory, string searchRoot)
+        {
+            try
+            {
+                if (isDirectory)
+                {
+                    var dirs = Directory.GetDirectories(searchRoot, fileName, SearchOption.AllDirectories);
+                    return dirs.FirstOrDefault();
+                }
+                else
+                {
+                    var files = Directory.GetFiles(searchRoot, fileName, SearchOption.AllDirectories);
+                    return files.FirstOrDefault();
+                }
+            }
+            catch { }
+
+            return null;
         }
 
         private List<DiskFile> ScanPhysicalDrive(string mountedPath)
@@ -745,6 +866,52 @@ namespace MountUtility.Services
         private Guid _active_disk_Id_or_throw(Guid id)
         {
             return id;
+        }
+
+        private void MarkDirectoryAsMoving(string directoryPath)
+        {
+            _movingDirectories[directoryPath] = DateTime.UtcNow;
+            Console.WriteLine($"📌 Marked directory as moving: {directoryPath}");
+        }
+
+        private bool IsDirectoryMoving(string filePath)
+        {
+            // Check if any parent directory is marked as moving
+            var current = Path.GetDirectoryName(filePath);
+            while (!string.IsNullOrEmpty(current))
+            {
+                if (_movingDirectories.TryGetValue(current, out var moveTime))
+                {
+                    // Check if the move window is still open
+                    if (DateTime.UtcNow - moveTime < TimeSpan.FromMilliseconds(MovingDirectoryWindowMs))
+                    {
+                        return true;
+                    }
+                    else
+                    {
+                        // Clean up expired entry
+                        _movingDirectories.TryRemove(current, out _);
+                    }
+                }
+
+                current = Path.GetDirectoryName(current);
+            }
+
+            return false;
+        }
+
+        private void CleanupExpiredMovingDirectories()
+        {
+            var now = DateTime.UtcNow;
+            var expired = _movingDirectories
+                .Where(kv => now - kv.Value >= TimeSpan.FromMilliseconds(MovingDirectoryWindowMs))
+                .Select(kv => kv.Key)
+                .ToList();
+
+            foreach (var path in expired)
+            {
+                _movingDirectories.TryRemove(path, out _);
+            }
         }
     }
 
