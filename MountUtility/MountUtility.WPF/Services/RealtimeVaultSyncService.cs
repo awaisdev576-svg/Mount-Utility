@@ -27,6 +27,11 @@ namespace MountUtility.Services
         private readonly ConcurrentDictionary<string, DateTime> _movingDirectories = new();
         private const int MovingDirectoryWindowMs = 5000;
 
+        // Cache to avoid unnecessary scanning
+        private string? _lastPhysicalDriveFingerprint;
+        private DateTime _lastReconciliationTime = DateTime.MinValue;
+        private const int ReconciliationCooldownMs = 5000;
+
         public RealtimeVaultSyncService(
             ICryptographyService cryptographyService,
             IDiskRepository diskRepository,
@@ -39,13 +44,46 @@ namespace MountUtility.Services
             _fileWatcher = fileWatcher;
         }
 
+        private Timer? _periodicScanTimer;
+
         public void Initialize(Guid diskId, string password, string mountPath)
         {
             _activeDiskId = diskId;
             _activePassword = password;
             _activeMountPath = mountPath?.TrimEnd('\\', '/');
 
+            // Start periodic scan to catch folder moves that don't fire watcher events
+            StartPeriodicReconciliation();
+
             Console.WriteLine($"✅ Realtime Sync initialized for disk {diskId} (mount: {_activeMountPath})");
+        }
+
+        private void StartPeriodicReconciliation()
+        {
+            if (_periodicScanTimer != null)
+            {
+                _periodicScanTimer.Dispose();
+            }
+
+            // Run reconciliation every 3 seconds to catch folder moves
+            _periodicScanTimer = new Timer(
+                async _ =>
+                {
+                    try
+                    {
+                        if (_activeDiskId.HasValue && !string.IsNullOrEmpty(_activeMountPath))
+                        {
+                            await ReconcileVaultWithPhysicalDriveAsync();
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"⚠️ Periodic reconciliation error: {ex.Message}");
+                    }
+                },
+                dueTime: TimeSpan.FromSeconds(3),
+                period: TimeSpan.FromSeconds(3)
+            );
         }
 
         public void Shutdown()
@@ -53,6 +91,12 @@ namespace MountUtility.Services
             _activeDiskId = null;
             _activePassword = null;
             _activeMountPath = null;
+
+            if (_periodicScanTimer != null)
+            {
+                _periodicScanTimer.Dispose();
+                _periodicScanTimer = null;
+            }
 
             Console.WriteLine("⛔ Realtime Sync shutdown");
         }
@@ -513,8 +557,15 @@ namespace MountUtility.Services
                 return;
             }
 
+            // Avoid excessive scanning - only reconcile if enough time has passed
+            if (DateTime.UtcNow - _lastReconciliationTime < TimeSpan.FromMilliseconds(ReconciliationCooldownMs))
+            {
+                return;
+            }
+
             try
             {
+                _lastReconciliationTime = DateTime.UtcNow;
                 Console.WriteLine("🔄 Starting vault/physical drive reconciliation...");
 
                 // Get all files from vault
