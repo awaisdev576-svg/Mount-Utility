@@ -233,6 +233,15 @@ namespace MountUtility.Services
                                 return;
                             }
 
+                            // Additional check: If parent directory doesn't exist, it means the whole folder was moved
+                            // In this case, skip individual file deletes and let the folder rename handle it
+                            var parentDir = Path.GetDirectoryName(fullPath);
+                            if (!string.IsNullOrEmpty(parentDir) && !Directory.Exists(parentDir))
+                            {
+                                Console.WriteLine($"⏭️ Skipping delete - parent directory was moved: {fullPath}");
+                                return;
+                            }
+
                             // if a directory was deleted, DeleteFileAsync can handle directory entry if present
                             var rel = GetRelativePath(fullPath, _activeMountPath!);
                             var deleted = await _virtualDiskService.DeleteFileAsync(_active_disk_Id_or_throw(_activeDiskId.Value), rel);
