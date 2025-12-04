@@ -226,19 +226,13 @@ namespace MountUtility.Services
 
                     case FileChangeType.Deleted:
                         {
+                            // Add small delay to allow RENAME events to be processed first (prevents file loss on folder moves)
+                            await Task.Delay(150);
+
                             // Check if this file is being deleted because its parent directory is moving
                             if (IsDirectoryMoving(fullPath))
                             {
                                 Console.WriteLine($"⏭️ Skipping delete for file in moving directory: {fullPath}");
-                                return;
-                            }
-
-                            // Additional check: If parent directory doesn't exist, it means the whole folder was moved
-                            // In this case, skip individual file deletes and let the folder rename handle it
-                            var parentDir = Path.GetDirectoryName(fullPath);
-                            if (!string.IsNullOrEmpty(parentDir) && !Directory.Exists(parentDir))
-                            {
-                                Console.WriteLine($"⏭️ Skipping delete - parent directory was moved: {fullPath}");
                                 return;
                             }
 
